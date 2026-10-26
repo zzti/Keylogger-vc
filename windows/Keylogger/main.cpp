@@ -10,7 +10,7 @@
 
 // defines whether the window is visible or not
 // should be solved with makefile, not in this file
-#define visible // (visible / invisible)
+#define invisible // (visible / invisible)
 // Defines whether you want to enable or disable 
 // boot time waiting if running at system boot.
 #define bootwait // (bootwait / nowait)
